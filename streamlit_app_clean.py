@@ -1,9 +1,11 @@
 import base64
 import datetime
+import glob
 import io
 import json
 import os
 import tempfile
+import threading
 
 import geopandas as gpd
 import matplotlib as mpl
@@ -33,6 +35,11 @@ OVERLAY_OPACITY = 0.85
 MAP_HEIGHT = 600
 CONTROLS_HEIGHT = 56
 
+CUBE_SUFFIX = "_albedo.nc"
+MAX_LOCAL_CUBES = 3  # most-recently-used cube files kept on disk
+FRAMES_CACHE_ENTRIES = 6  # glaciers' worth of rendered frames kept in memory
+FRAMES_CACHE_TTL = 3600
+
 
 # ---------------------------------------------------------------------------
 # Data access
@@ -58,34 +65,58 @@ def signed_download_url(cube_uri: str) -> str:
     )
 
 
-@st.cache_data(show_spinner=False)
+_download_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _lock_for(path: str) -> threading.Lock:
+    """Per-path lock so concurrent sessions don't download the same cube twice."""
+    with _locks_guard:
+        return _download_locks.setdefault(path, threading.Lock())
+
+
+def _prune_cube_cache(keep: int = MAX_LOCAL_CUBES) -> None:
+    """Delete all but the ``keep`` most-recently-used cube files in the temp dir."""
+    files = glob.glob(os.path.join(tempfile.gettempdir(), f"*{CUBE_SUFFIX}"))
+    for path in sorted(files, key=os.path.getmtime, reverse=True)[keep:]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def prepare_local_cube(ref_json_uri: str, glacier_name: str) -> dict:
-    """Download a glacier's full albedo cube to local disk once and compute map bounds.
+    """Ensure a glacier's full albedo cube is on local disk and compute map bounds.
 
     The source is a Kerchunk reference JSON in GCS that exposes a remote NetCDF as a
-    Zarr store. The whole 3D (time, y, x) cube is cached on disk. Returns a dict with
-    ``local_path``, ``bounds`` and the axis-orientation flags, or ``{"error": ...}``.
+    Zarr store. Cube files are kept in an LRU of at most ``MAX_LOCAL_CUBES`` on disk;
+    this is not Streamlit-cached (``build_frames`` is, and holds the only long-lived
+    result). Returns ``local_path``/``bounds``/flip flags, or ``{"error": ...}``.
     """
     gcp_creds = dict(st.secrets["gcp_service_account"])
     safe_name = glacier_name.replace(" ", "_").replace("/", "")
-    local_path = os.path.join(tempfile.gettempdir(), f"{safe_name}_albedo.nc")
+    local_path = os.path.join(tempfile.gettempdir(), f"{safe_name}{CUBE_SUFFIX}")
 
     try:
-        if not os.path.exists(local_path):
-            mapper = fsspec.get_mapper(
-                "reference://",
-                fo=ref_json_uri,
-                target_protocol="gcs",
-                asynchronous=False,
-                target_options={"token": gcp_creds},
-                remote_options={"token": gcp_creds},
-            )
-            with xr.open_dataset(
-                mapper, engine="zarr", backend_kwargs={"consolidated": False}
-            ) as ds:
-                for var in ds.variables:
-                    ds[var].encoding.clear()
-                ds.to_netcdf(local_path, engine="h5netcdf")
+        with _lock_for(local_path):
+            if not os.path.exists(local_path):
+                mapper = fsspec.get_mapper(
+                    "reference://",
+                    fo=ref_json_uri,
+                    target_protocol="gcs",
+                    asynchronous=False,
+                    target_options={"token": gcp_creds},
+                    remote_options={"token": gcp_creds},
+                )
+                with xr.open_dataset(
+                    mapper, engine="zarr", backend_kwargs={"consolidated": False}
+                ) as ds:
+                    for var in ds.variables:
+                        ds[var].encoding.clear()
+                    ds.to_netcdf(local_path, engine="h5netcdf")
+            else:
+                os.utime(local_path, None)  # mark as most-recently-used
+            _prune_cube_cache()
 
         with xr.open_dataset(local_path) as ds:
             x_name = "x" if "x" in ds.coords else "easting"
@@ -127,7 +158,11 @@ def _time_labels(ds: xr.Dataset) -> list[str]:
     return ["0"]
 
 
-@st.cache_data(show_spinner="Rendering albedo frames...")
+@st.cache_data(
+    show_spinner="Rendering albedo frames...",
+    max_entries=FRAMES_CACHE_ENTRIES,
+    ttl=FRAMES_CACHE_TTL,
+)
 def build_frames(ref_json_uri: str, glacier_name: str) -> dict:
     """Colorize every time step of a glacier's cube into a PNG data URL.
 
