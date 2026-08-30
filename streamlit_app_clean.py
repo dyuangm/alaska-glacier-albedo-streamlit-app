@@ -26,6 +26,9 @@ CUBE_DIR = "s2_glacier_cubes_slope_dem"
 SIGNED_URL_TTL = datetime.timedelta(minutes=15)
 ALASKA_VIEW = {"center": [64.2, -149.5], "zoom": 5}
 ALBEDO_VAR = "albedo"
+ALBEDO_VMIN = 0.0
+ALBEDO_VMAX = 1.0
+ALBEDO_CMAP = "Greys_r"
 OVERLAY_OPACITY = 0.85
 MAP_HEIGHT = 600
 CONTROLS_HEIGHT = 56
@@ -161,8 +164,20 @@ def build_frames(ref_json_uri: str, glacier_name: str) -> dict:
 # ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------
+def _colormap_css_stops(cmap_name: str = ALBEDO_CMAP, n: int = 24) -> list[str]:
+    """Sample a matplotlib colormap into hex stops spanning vmin -> vmax."""
+    try:
+        cmap = mpl.colormaps[cmap_name]
+    except KeyError:
+        cmap = mpl.colormaps["viridis"]
+    return [mcolors.to_hex(cmap(i / (n - 1))) for i in range(n)]
+
+
 def array_to_png_data_url(
-    data: np.ndarray, vmin: float = 0.1, vmax: float = 0.9, cmap_name: str = "Greys_r"
+    data: np.ndarray,
+    vmin: float = ALBEDO_VMIN,
+    vmax: float = ALBEDO_VMAX,
+    cmap_name: str = ALBEDO_CMAP,
 ) -> str | None:
     """Colorize a 2D array and return it as a base64 PNG data URL for a map overlay."""
     data = np.squeeze(data)
@@ -242,6 +257,7 @@ def render_map(frame_data: dict | None, outline_geojson: dict | None) -> None:
     frames = (frame_data or {}).get("frames", [])
     bounds = (frame_data or {}).get("bounds")
 
+    gradient = "linear-gradient(to top, " + ", ".join(_colormap_css_stops()) + ")"
     payload = json.dumps(
         {
             "frames": frames,
@@ -250,6 +266,13 @@ def render_map(frame_data: dict | None, outline_geojson: dict | None) -> None:
             "opacity": OVERLAY_OPACITY,
             "alaska": ALASKA_VIEW,
             "mapHeight": MAP_HEIGHT,
+            "legend": {
+                "title": "Albedo",
+                "gradient": gradient,
+                "ticks": [
+                    f"{v:.2f}" for v in np.linspace(ALBEDO_VMAX, ALBEDO_VMIN, 5)
+                ],
+            },
         }
     )
 
@@ -278,6 +301,27 @@ _MAP_TEMPLATE = """
     font-variant-numeric: tabular-nums; min-width: 96px; text-align: right;
     color: #333;
   }
+  /* Show albedo cells as sharp blocks instead of bilinear-smoothed mush. */
+  .albedo-overlay {
+    image-rendering: -webkit-optimize-contrast;
+    image-rendering: crisp-edges;
+    image-rendering: pixelated;
+  }
+  .albedo-legend {
+    background: rgba(255, 255, 255, 0.9);
+    padding: 6px 8px; border-radius: 4px;
+    font: 11px/1.2 -apple-system, system-ui, sans-serif; color: #333;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  }
+  .albedo-legend .title { font-weight: 600; text-align: center; margin-bottom: 4px; }
+  .albedo-legend .body { display: flex; gap: 4px; }
+  .albedo-legend .bar {
+    width: 14px; height: 110px; border: 1px solid #999;
+  }
+  .albedo-legend .ticks {
+    display: flex; flex-direction: column; justify-content: space-between;
+    height: 112px; font-variant-numeric: tabular-nums;
+  }
 </style>
 <div id="map"></div>
 <div id="controls">
@@ -290,12 +334,34 @@ _MAP_TEMPLATE = """
   var D = __PAYLOAD__;
   var map = L.map('map');
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 18, attribution: '&copy; OpenStreetMap contributors'
+    maxNativeZoom: 19, maxZoom: 22,
+    attribution: '&copy; OpenStreetMap contributors'
   }).addTo(map);
+  L.control.scale({ position: 'bottomleft', metric: true, imperial: true }).addTo(map);
 
   if (D.bounds) { map.fitBounds(D.bounds); }
   else { map.setView(D.alaska.center, D.alaska.zoom); }
   setTimeout(function () { map.invalidateSize(); }, 120);
+
+  var frames = D.frames || [];
+
+  if (D.legend && frames.length) {
+    var legend = L.control({ position: 'bottomright' });
+    legend.onAdd = function () {
+      var div = L.DomUtil.create('div', 'albedo-legend');
+      var ticks = D.legend.ticks.map(function (t) {
+        return '<span>' + t + '</span>';
+      }).join('');
+      div.innerHTML =
+        '<div class="title">' + D.legend.title + '</div>' +
+        '<div class="body">' +
+          '<div class="bar" style="background:' + D.legend.gradient + '"></div>' +
+          '<div class="ticks">' + ticks + '</div>' +
+        '</div>';
+      return div;
+    };
+    legend.addTo(map);
+  }
 
   if (D.outline) {
     L.geoJSON(D.outline, {
@@ -313,7 +379,6 @@ _MAP_TEMPLATE = """
   var slider = document.getElementById('slider');
   var label = document.getElementById('label');
   var playBtn = document.getElementById('play');
-  var frames = D.frames || [];
   var overlay = null;
   var cur = 0;
   var timer = null;
@@ -323,7 +388,7 @@ _MAP_TEMPLATE = """
     var fr = frames[i];
     if (!overlay) {
       overlay = L.imageOverlay(fr.url, D.bounds, {
-        opacity: D.opacity, interactive: false
+        opacity: D.opacity, interactive: false, className: 'albedo-overlay'
       }).addTo(map);
     } else {
       overlay.setUrl(fr.url);
