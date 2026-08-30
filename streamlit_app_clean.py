@@ -85,16 +85,17 @@ def _prune_cube_cache(keep: int = MAX_LOCAL_CUBES) -> None:
             pass
 
 
-def prepare_local_cube(ref_json_uri: str, glacier_name: str) -> dict:
+def prepare_local_cube(ref_json_uri: str, glacier_id: str) -> dict:
     """Ensure a glacier's full albedo cube is on local disk and compute map bounds.
 
+    ``glacier_id`` is any stable, filesystem-safe key for the glacier (its RGI ID).
     The source is a Kerchunk reference JSON in GCS that exposes a remote NetCDF as a
     Zarr store. Cube files are kept in an LRU of at most ``MAX_LOCAL_CUBES`` on disk;
     this is not Streamlit-cached (``build_frames`` is, and holds the only long-lived
     result). Returns ``local_path``/``bounds``/flip flags, or ``{"error": ...}``.
     """
     gcp_creds = dict(st.secrets["gcp_service_account"])
-    safe_name = glacier_name.replace(" ", "_").replace("/", "")
+    safe_name = glacier_id.replace(" ", "_").replace("/", "")
     local_path = os.path.join(tempfile.gettempdir(), f"{safe_name}{CUBE_SUFFIX}")
 
     try:
@@ -163,13 +164,13 @@ def _time_labels(ds: xr.Dataset) -> list[str]:
     max_entries=FRAMES_CACHE_ENTRIES,
     ttl=FRAMES_CACHE_TTL,
 )
-def build_frames(ref_json_uri: str, glacier_name: str) -> dict:
+def build_frames(ref_json_uri: str, glacier_id: str) -> dict:
     """Colorize every time step of a glacier's cube into a PNG data URL.
 
     Returns ``{"bounds": [...], "frames": [{"label": str, "url": str}, ...]}`` so the
     browser can scrub through time without any Streamlit reruns, or ``{"error": ...}``.
     """
-    cube_meta = prepare_local_cube(ref_json_uri, glacier_name)
+    cube_meta = prepare_local_cube(ref_json_uri, glacier_id)
     if "error" in cube_meta:
         return cube_meta
 
@@ -465,7 +466,25 @@ _MAP_TEMPLATE = """
 st.set_page_config(page_title="Alaska Glacier Albedo Explorer", layout="wide")
 
 gdf = load_glacier_data()
-glacier_names = sorted(gdf["glacier_name"].dropna().unique().tolist())
+gdf = gdf.dropna(subset=["rgi_id"]).drop_duplicates(subset=["rgi_id"])
+_name_by_rgi = dict(zip(gdf["rgi_id"], gdf["glacier_name"].fillna("")))
+
+
+def glacier_name_of(rgi_id: str) -> str:
+    """Display name for a glacier, falling back to its RGI ID when unnamed."""
+    return (_name_by_rgi.get(rgi_id) or "").strip() or rgi_id
+
+
+def glacier_label(rgi_id: str) -> str:
+    """Dropdown label: ``Name — RGI ID`` (or just the RGI ID when unnamed)."""
+    name = (_name_by_rgi.get(rgi_id) or "").strip()
+    return f"{name} — {rgi_id}" if name else rgi_id
+
+
+rgi_options = sorted(
+    gdf["rgi_id"],
+    key=lambda r: (not (_name_by_rgi.get(r) or "").strip(), glacier_label(r).lower()),
+)  # named glaciers first (A-Z), then unnamed by RGI ID
 
 st.title("Alaska Glacier Albedo Explorer")
 st.markdown(
@@ -475,32 +494,33 @@ st.markdown(
 
 with st.sidebar:
     st.header("Controls")
-    selected_glacier = st.selectbox(
-        "Search for a Glacier:",
-        options=glacier_names,
+    selected_rgi = st.selectbox(
+        "Search by glacier name or RGI ID:",
+        options=rgi_options,
         index=None,
-        placeholder="Type or select a glacier...",
+        format_func=glacier_label,
+        placeholder="Type a glacier name or RGI ID...",
         key="glacier_search",
     )
 
 frame_data = None
 outline_geojson = None
-if selected_glacier:
-    row = gdf.loc[gdf["glacier_name"] == selected_glacier].iloc[0]
-    frame_data = build_frames(row["gcs_uri"], selected_glacier)
-    outline_geojson = json.loads(
-        gdf.loc[gdf["glacier_name"] == selected_glacier].to_json()
-    )
+if selected_rgi:
+    match = gdf.loc[gdf["rgi_id"] == selected_rgi]
+    row = match.iloc[0]
+    frame_data = build_frames(row["gcs_uri"], selected_rgi)
+    outline_geojson = json.loads(match.to_json())
 
 with st.sidebar:
     st.divider()
     st.subheader("Export")
-    if not selected_glacier:
+    if not selected_rgi:
         st.markdown("*Select a glacier to enable downloads.*")
     else:
+        name = glacier_name_of(selected_rgi)
         try:
             st.link_button(
-                f"Download {selected_glacier} NetCDF",
+                f"Download {name} NetCDF",
                 signed_download_url(row["cube_uri"]),
                 help="Temporary link straight from Google Cloud Storage (expires in 15 min).",
             )
