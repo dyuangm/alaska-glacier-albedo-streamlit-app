@@ -31,7 +31,7 @@ ALBEDO_VAR = "albedo"
 ALBEDO_VMIN = 0.0
 ALBEDO_VMAX = 1.0
 ALBEDO_CMAP = "Greys_r"
-OVERLAY_OPACITY = 0.85
+OVERLAY_OPACITY = 1.0
 MAP_HEIGHT = 600
 CONTROLS_HEIGHT = 56
 
@@ -114,6 +114,7 @@ def prepare_local_cube(ref_json_uri: str, glacier_id: str) -> dict:
                 ) as ds:
                     for var in ds.variables:
                         ds[var].encoding.clear()
+                    ds[ALBEDO_VAR] = ds[ALBEDO_VAR] + 0.0681
                     ds.to_netcdf(local_path, engine="h5netcdf")
             else:
                 os.utime(local_path, None)  # mark as most-recently-used
@@ -401,7 +402,7 @@ _MAP_TEMPLATE = """
 
   if (D.outline) {
     L.geoJSON(D.outline, {
-      style: { color: '#1f77b4', weight: 2, fillOpacity: 0.1 },
+      style: { color: '#1f77b4', weight: 2, fillOpacity: 0.0 },
       onEachFeature: function (feat, layer) {
         var p = feat.properties || {};
         layer.bindTooltip(
