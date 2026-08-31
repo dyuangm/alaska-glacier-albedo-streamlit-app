@@ -11,21 +11,25 @@ import geopandas as gpd
 import matplotlib as mpl
 import matplotlib.colors as mcolors
 import numpy as np
-import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 import xarray as xr
-import fsspec
 from google.cloud import storage
 from PIL import Image
 from pyproj import Transformer
 from shapely.geometry import MultiPolygon
 
-GLACIER_INDEX_PATH = "glacier_index_v2.parquet"
-CUBE_INDEX_PATH = "glacier_index.parquet"  # v1 index: gcs_uri points at the raw .nc
-JSON_DIR = "s2_json"
-CUBE_DIR = "s2_glacier_cubes_slope_dem"
+GLACIER_INDEX_PATH = "glacier_index_complete.parquet"
 SIGNED_URL_TTL = datetime.timedelta(minutes=15)
+
+# Sensors selectable in the sidebar. ``uri_col`` is the raw NetCDF cube URI column in
+# the index; ``albedo_offset`` is a per-sensor additive bias correction.
+SENSORS = {
+    "Sentinel 2": {"uri_col": "s2_gcs_uri", "albedo_offset": 0.0681},
+    "Landsat 8": {"uri_col": "l8_gcs_uri", "albedo_offset": 0.0681},
+}
+DEFAULT_SENSOR = "Sentinel 2"
+
 ALASKA_VIEW = {"center": [64.2, -149.5], "zoom": 5}
 ALBEDO_VAR = "albedo"
 ALBEDO_VMIN = 0.0
@@ -85,42 +89,39 @@ def _prune_cube_cache(keep: int = MAX_LOCAL_CUBES) -> None:
             pass
 
 
-def prepare_local_cube(ref_json_uri: str, glacier_id: str) -> dict:
-    """Ensure a glacier's full albedo cube is on local disk and compute map bounds.
+def _download_blob(gs_uri: str, dest: str) -> None:
+    """Download ``gs://bucket/key`` to ``dest`` atomically."""
+    bucket_name, _, blob_name = gs_uri.removeprefix("gs://").partition("/")
+    part = dest + ".part"
+    try:
+        _storage_client().bucket(bucket_name).blob(blob_name).download_to_filename(part)
+        os.replace(part, dest)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
 
-    ``glacier_id`` is any stable, filesystem-safe key for the glacier (its RGI ID).
-    The source is a Kerchunk reference JSON in GCS that exposes a remote NetCDF as a
-    Zarr store. Cube files are kept in an LRU of at most ``MAX_LOCAL_CUBES`` on disk;
-    this is not Streamlit-cached (``build_frames`` is, and holds the only long-lived
-    result). Returns ``local_path``/``bounds``/flip flags, or ``{"error": ...}``.
+
+def prepare_local_cube(cube_uri: str, glacier_id: str, sensor: str) -> dict:
+    """Ensure a glacier's albedo cube is on local disk and compute map bounds.
+
+    Downloads the raw NetCDF cube straight from GCS. ``glacier_id`` (the RGI ID) and
+    ``sensor`` form the on-disk filename. Cube files are kept in an LRU of at most
+    ``MAX_LOCAL_CUBES`` on disk; this is not Streamlit-cached (``build_frames`` is, and
+    holds the only long-lived result). Returns ``local_path``/``bounds``/flip flags,
+    or ``{"error": ...}``.
     """
-    gcp_creds = dict(st.secrets["gcp_service_account"])
-    safe_name = glacier_id.replace(" ", "_").replace("/", "")
+    safe_name = f"{sensor}_{glacier_id}".replace(" ", "_").replace("/", "")
     local_path = os.path.join(tempfile.gettempdir(), f"{safe_name}{CUBE_SUFFIX}")
 
     try:
         with _lock_for(local_path):
             if not os.path.exists(local_path):
-                mapper = fsspec.get_mapper(
-                    "reference://",
-                    fo=ref_json_uri,
-                    target_protocol="gcs",
-                    asynchronous=False,
-                    target_options={"token": gcp_creds},
-                    remote_options={"token": gcp_creds},
-                )
-                with xr.open_dataset(
-                    mapper, engine="zarr", backend_kwargs={"consolidated": False}
-                ) as ds:
-                    for var in ds.variables:
-                        ds[var].encoding.clear()
-                    ds[ALBEDO_VAR] = ds[ALBEDO_VAR] + 0.0681
-                    ds.to_netcdf(local_path, engine="h5netcdf")
+                _download_blob(cube_uri, local_path)
             else:
                 os.utime(local_path, None)  # mark as most-recently-used
             _prune_cube_cache()
 
-        with xr.open_dataset(local_path) as ds:
+        with xr.open_dataset(local_path, engine="h5netcdf") as ds:
             x_name = "x" if "x" in ds.coords else "easting"
             y_name = "y" if "y" in ds.coords else "northing"
             x, y = ds.coords[x_name].values, ds.coords[y_name].values
@@ -161,25 +162,28 @@ def _time_labels(ds: xr.Dataset) -> list[str]:
 
 
 @st.cache_data(
-    show_spinner="Rendering albedo frames...",
+    show_spinner="Loading albedo cube...",
     max_entries=FRAMES_CACHE_ENTRIES,
     ttl=FRAMES_CACHE_TTL,
 )
-def build_frames(ref_json_uri: str, glacier_id: str) -> dict:
+def build_frames(cube_uri: str, glacier_id: str, sensor: str) -> dict:
     """Colorize every time step of a glacier's cube into a PNG data URL.
 
     Returns ``{"bounds": [...], "frames": [{"label": str, "url": str}, ...]}`` so the
     browser can scrub through time without any Streamlit reruns, or ``{"error": ...}``.
     """
-    cube_meta = prepare_local_cube(ref_json_uri, glacier_id)
+    cube_meta = prepare_local_cube(cube_uri, glacier_id, sensor)
     if "error" in cube_meta:
         return cube_meta
 
     try:
-        with xr.open_dataset(cube_meta["local_path"]) as ds:
+        with xr.open_dataset(cube_meta["local_path"], engine="h5netcdf") as ds:
             labels = _time_labels(ds)
             cube = np.asarray(ds[ALBEDO_VAR].values, dtype="float32")
 
+        offset = SENSORS[sensor]["albedo_offset"]
+        if offset:
+            cube = cube + offset
         if cube.ndim == 2:  # single time step
             cube = cube[None, ...]
         if cube_meta["flip_y"]:
@@ -239,24 +243,6 @@ def array_to_png_data_url(
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
 
 
-def _resolve_cube_uris(gdf: gpd.GeoDataFrame) -> pd.Series:
-    """Raw NetCDF cube URI per glacier.
-
-    The v2 index stores the Kerchunk reference JSON in ``gcs_uri``; the raw cube sits
-    in a sibling directory. Prefer the authoritative URI from the v1 index (joined on
-    ``rgi_id``), falling back to rewriting the JSON path.
-    """
-    derived = gdf["gcs_uri"].str.replace(
-        f"/{JSON_DIR}/", f"/{CUBE_DIR}/", regex=False
-    ).str.replace(r"\.json$", ".nc", regex=True)
-
-    if os.path.exists(CUBE_INDEX_PATH) and "rgi_id" in gdf.columns:
-        v1 = pd.read_parquet(CUBE_INDEX_PATH, columns=["rgi_id", "gcs_uri"])
-        lookup = dict(zip(v1["rgi_id"], v1["gcs_uri"]))
-        return gdf["rgi_id"].map(lookup).fillna(derived)
-    return derived
-
-
 @st.cache_data
 def load_glacier_data() -> gpd.GeoDataFrame:
     """Load the glacier index, normalize geometries, and reproject to EPSG:4326."""
@@ -277,15 +263,17 @@ def load_glacier_data() -> gpd.GeoDataFrame:
 
     gdf = gpd.read_parquet(GLACIER_INDEX_PATH)
     gdf["geometry"] = gdf["geometry"].apply(clean_geometry)
-    keep_cols = ["glacier_name", "gcs_uri", "geometry", "rgi_id"]
+    uri_cols = [cfg["uri_col"] for cfg in SENSORS.values()]
+    keep_cols = ["glacier_name", "geometry", "rgi_id", *uri_cols]
     gdf = gdf[[c for c in keep_cols if c in gdf.columns]]
-    gdf["cube_uri"] = _resolve_cube_uris(gdf)
     if gdf.crs != "EPSG:4326":
         gdf = gdf.to_crs("EPSG:4326")
     return gdf
 
 
-def render_map(frame_data: dict | None, outline_geojson: dict | None) -> None:
+def render_map(
+    frame_data: dict | None, outline_geojson: dict | None, sensor: str | None = None
+) -> None:
     """Render a self-contained Leaflet map with a client-side time slider.
 
     The map only reloads when its HTML changes (i.e. a different glacier). Moving the
@@ -304,7 +292,7 @@ def render_map(frame_data: dict | None, outline_geojson: dict | None) -> None:
             "alaska": ALASKA_VIEW,
             "mapHeight": MAP_HEIGHT,
             "legend": {
-                "title": "Albedo",
+                "title": f"Albedo — {sensor}" if sensor else "Albedo",
                 "gradient": gradient,
                 "ticks": [
                     f"{v:.2f}" for v in np.linspace(ALBEDO_VMAX, ALBEDO_VMIN, 5)
@@ -489,12 +477,18 @@ rgi_options = sorted(
 
 st.title("Alaska Glacier Albedo Explorer")
 st.markdown(
-    "Explore albedo data for glaciers across Alaska. Pick a glacier in the sidebar, "
-    "then scrub or play the time slider under the map."
+    "Explore albedo data for glaciers across Alaska. Choose a sensor and glacier in "
+    "the sidebar, then scrub or play the time slider under the map."
 )
 
 with st.sidebar:
     st.header("Controls")
+    sensor = st.selectbox(
+        "Sensor:",
+        options=list(SENSORS),
+        index=list(SENSORS).index(DEFAULT_SENSOR),
+        key="sensor",
+    )
     selected_rgi = st.selectbox(
         "Search by glacier name or RGI ID:",
         options=rgi_options,
@@ -504,13 +498,17 @@ with st.sidebar:
         key="glacier_search",
     )
 
+uri_col = SENSORS[sensor]["uri_col"]
+
 frame_data = None
 outline_geojson = None
+cube_uri = None
 if selected_rgi:
     match = gdf.loc[gdf["rgi_id"] == selected_rgi]
     row = match.iloc[0]
-    frame_data = build_frames(row["gcs_uri"], selected_rgi)
-    outline_geojson = json.loads(match.to_json())
+    cube_uri = row[uri_col]
+    frame_data = build_frames(cube_uri, selected_rgi, sensor)
+    outline_geojson = json.loads(match[["glacier_name", "rgi_id", "geometry"]].to_json())
 
 with st.sidebar:
     st.divider()
@@ -521,8 +519,8 @@ with st.sidebar:
         name = glacier_name_of(selected_rgi)
         try:
             st.link_button(
-                f"Download {name} NetCDF",
-                signed_download_url(row["cube_uri"]),
+                f"Download {name} — {sensor} NetCDF",
+                signed_download_url(cube_uri),
                 help="Temporary link straight from Google Cloud Storage (expires in 15 min).",
             )
         except Exception as exc:  # noqa: BLE001
@@ -531,4 +529,8 @@ with st.sidebar:
 if frame_data and "error" in frame_data:
     st.error(f"Failed to load data: {frame_data['error']}")
 
-render_map(frame_data if frame_data and "error" not in frame_data else None, outline_geojson)
+render_map(
+    frame_data if frame_data and "error" not in frame_data else None,
+    outline_geojson,
+    sensor,
+)
