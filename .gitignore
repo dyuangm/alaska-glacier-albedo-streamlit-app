@@ -7,14 +7,3 @@ __pycache__/
 .venv/
 venv/
 
-# Data / artifacts (host these; don't put them in git history)
-*.nc
-json_blobs/
-
-# Scratch
-test.py
-app.py
-app2.py
-app3.py
-app4.py
-app5.py
