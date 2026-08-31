@@ -19,7 +19,7 @@ from PIL import Image
 from pyproj import Transformer
 from shapely.geometry import MultiPolygon
 
-GLACIER_INDEX_PATH = "glacier_index_complete.parquet"
+GLACIER_INDEX_URI = "gs://alaska-albedo-scenes-cmu-research-bucket/indexes/glacier_index_complete.parquet"
 SIGNED_URL_TTL = datetime.timedelta(minutes=15)
 
 # Sensors selectable in the sidebar. ``uri_col`` is the raw NetCDF cube URI column in
@@ -53,6 +53,12 @@ def _storage_client() -> storage.Client:
     return storage.Client.from_service_account_info(
         dict(st.secrets["gcp_service_account"])
     )
+
+
+def _read_gcs_bytes(gs_uri: str) -> bytes:
+    """Fetch the full contents of a ``gs://bucket/key`` object into memory."""
+    bucket_name, _, blob_name = gs_uri.removeprefix("gs://").partition("/")
+    return _storage_client().bucket(bucket_name).blob(blob_name).download_as_bytes()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -243,9 +249,9 @@ def array_to_png_data_url(
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
 
 
-@st.cache_data
+@st.cache_data(show_spinner="Loading glacier index...")
 def load_glacier_data() -> gpd.GeoDataFrame:
-    """Load the glacier index, normalize geometries, and reproject to EPSG:4326."""
+    """Load the glacier index from GCS, normalize geometries, reproject to EPSG:4326."""
 
     def clean_geometry(geom):
         if geom is None or geom.geom_type in ("Polygon", "MultiPolygon"):
@@ -261,7 +267,7 @@ def load_glacier_data() -> gpd.GeoDataFrame:
                 return MultiPolygon(polys)
         return geom
 
-    gdf = gpd.read_parquet(GLACIER_INDEX_PATH)
+    gdf = gpd.read_parquet(io.BytesIO(_read_gcs_bytes(GLACIER_INDEX_URI)))
     gdf["geometry"] = gdf["geometry"].apply(clean_geometry)
     uri_cols = [cfg["uri_col"] for cfg in SENSORS.values()]
     keep_cols = ["glacier_name", "geometry", "rgi_id", *uri_cols]
