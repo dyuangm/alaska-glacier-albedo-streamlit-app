@@ -1,315 +1,536 @@
-import io
 import base64
-import streamlit as st
-from shapely.geometry import Polygon, MultiPolygon
-import geopandas as gpd
-import pandas as pd
-import numpy as np
-import folium
-import os
-from folium.raster_layers import ImageOverlay
-from streamlit_folium import st_folium
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
-from PIL import Image
-import fsspec
 import datetime
+import glob
+import io
+import json
+import os
+import tempfile
+import threading
+
+import geopandas as gpd
+import matplotlib as mpl
+import matplotlib.colors as mcolors
+import numpy as np
+import streamlit as st
+import streamlit.components.v1 as components
 import xarray as xr
+from google.cloud import storage
+from PIL import Image
 from pyproj import Transformer
+from shapely.geometry import MultiPolygon
 
-# @st.cache_data(show_spinner=False)
-# def fetch_kerchunk_slice(ref_json_uri: str, str_date: str, var_name: str = "albedo"):
-#     """Fetches a single glacier's time slice using Kerchunk."""
-#     try:
-#         mapper = fsspec.get_mapper(
-#             "reference://",
-#             fo=ref_json_uri,
-#             target_protocol="gcs",
-#             target_options={"token": None}, # Auth to read the .json file
-#             remote_options={"token": None}  # Auth to read the .nc file bytes
-#         )        
-#         with xr.open_dataset(mapper, engine="zarr", backend_kwargs={"consolidated": False}) as ds:
-#             if "time" in ds.coords: time_slice = ds[var_name].sel(time=str_date, method="nearest")
-#             else: time_slice = ds[var_name].isel(time=0)
+GLACIER_INDEX_PATH = "glacier_index_complete.parquet"
+SIGNED_URL_TTL = datetime.timedelta(minutes=15)
 
-#             x_name = "x" if "x" in ds.coords else "easting"
-#             y_name = "y" if "y" in ds.coords else "northing"
-#             x, y = ds.coords[x_name].values, ds.coords[y_name].values
-#             albedo_data = time_slice.values
+# Sensors selectable in the sidebar. ``uri_col`` is the raw NetCDF cube URI column in
+# the index; ``albedo_offset`` is a per-sensor additive bias correction.
+SENSORS = {
+    "Sentinel 2": {"uri_col": "s2_gcs_uri", "albedo_offset": 0.0681},
+    "Landsat 8": {"uri_col": "l8_gcs_uri", "albedo_offset": 0.0681},
+}
+DEFAULT_SENSOR = "Sentinel 2"
 
-#             src_crs_wkt = None
-#             for var in ds.data_vars:
-#                 if 'wkt' in ds[var].attrs: src_crs_wkt = ds[var].attrs['wkt']; break
-#                 if 'spatial_ref' in ds[var].attrs: src_crs_wkt = ds[var].attrs['spatial_ref']; break
-#             src_crs = src_crs_wkt if src_crs_wkt else "EPSG:32607"
+ALASKA_VIEW = {"center": [64.2, -149.5], "zoom": 5}
+ALBEDO_VAR = "albedo"
+ALBEDO_VMIN = 0.0
+ALBEDO_VMAX = 1.0
+ALBEDO_CMAP = "Greys_r"
+OVERLAY_OPACITY = 1.0
+MAP_HEIGHT = 600
+CONTROLS_HEIGHT = 56
 
-#             if y[0] < y[-1]: y = y[::-1]; albedo_data = np.flipud(albedo_data)
-#             if x[0] > x[-1]: x = x[::-1]; albedo_data = np.fliplr(albedo_data)
+CUBE_SUFFIX = "_albedo.nc"
+MAX_LOCAL_CUBES = 2  # most-recently-used cube files kept on disk
+FRAMES_CACHE_ENTRIES = 3  # glaciers' worth of rendered frames kept in memory
+FRAMES_CACHE_TTL = 3600
 
-#             min_x, max_x = x[0], x[-1]
-#             min_y, max_y = y[0], y[-1]
 
-#             transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-#             lon_nw, lat_nw = transformer.transform(min_x, max_y)
-#             lon_se, lat_se = transformer.transform(max_x, min_y)
+# ---------------------------------------------------------------------------
+# Data access
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def _storage_client() -> storage.Client:
+    return storage.Client.from_service_account_info(
+        dict(st.secrets["gcp_service_account"])
+    )
 
-#             bounds = [[float(lat_se), float(lon_nw)], [float(lat_nw), float(lon_se)]]
-#             return {"uri": ref_json_uri, "bounds": bounds, "data": albedo_data}
-            
-#     except Exception as e:
-#         return {"uri": ref_json_uri, "error": str(e)}
 
-@st.cache_data(show_spinner=False)
-def prepare_local_cube(ref_json_uri: str, glacier_name: str):
-    """Downloads the full cube to disk once and computes map bounds."""
-    safe_name = glacier_name.replace(" ", "_").replace("/", "")
-    local_path = f"{safe_name}_albedo.nc"
-    
+@st.cache_data(ttl=600, show_spinner=False)
+def signed_download_url(cube_uri: str) -> str:
+    """A short-lived v4 signed URL so the browser pulls the raw cube straight from GCS.
+
+    ``cube_uri`` is a ``gs://bucket/path/glacier.nc`` URI. Cached for less than the
+    link's own lifetime so a stale URL is never handed out.
+    """
+    bucket_name, _, blob_name = cube_uri.removeprefix("gs://").partition("/")
+    blob = _storage_client().bucket(bucket_name).blob(blob_name)
+    return blob.generate_signed_url(
+        version="v4", expiration=SIGNED_URL_TTL, method="GET"
+    )
+
+
+_download_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _lock_for(path: str) -> threading.Lock:
+    """Per-path lock so concurrent sessions don't download the same cube twice."""
+    with _locks_guard:
+        return _download_locks.setdefault(path, threading.Lock())
+
+
+def _prune_cube_cache(keep: int = MAX_LOCAL_CUBES) -> None:
+    """Delete all but the ``keep`` most-recently-used cube files in the temp dir."""
+    files = glob.glob(os.path.join(tempfile.gettempdir(), f"*{CUBE_SUFFIX}"))
+    for path in sorted(files, key=os.path.getmtime, reverse=True)[keep:]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _download_blob(gs_uri: str, dest: str) -> None:
+    """Download ``gs://bucket/key`` to ``dest`` atomically."""
+    bucket_name, _, blob_name = gs_uri.removeprefix("gs://").partition("/")
+    part = dest + ".part"
     try:
-        # 1. Download to local disk if it doesn't exist yet
-        if not os.path.exists(local_path):
-            mapper = fsspec.get_mapper(
-                "reference://", fo=ref_json_uri, target_protocol="gcs",
-                asynchronous=False, target_options={"asynchronous": False},
-                remote_options={"asynchronous": False}
-            )            
-            with xr.open_dataset(mapper, engine="zarr", backend_kwargs={"consolidated": False}) as ds:
-                for var in ds.variables:
-                    ds[var].encoding.clear()
-                ds.to_netcdf(local_path, engine="h5netcdf") # Saves the entire 3D cube locally
-                
-        # 2. Compute bounds once so we don't recalculate on every slider move
-        with xr.open_dataset(local_path) as ds:
+        _storage_client().bucket(bucket_name).blob(blob_name).download_to_filename(part)
+        os.replace(part, dest)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
+def prepare_local_cube(cube_uri: str, glacier_id: str, sensor: str) -> dict:
+    """Ensure a glacier's albedo cube is on local disk and compute map bounds.
+
+    Downloads the raw NetCDF cube straight from GCS. ``glacier_id`` (the RGI ID) and
+    ``sensor`` form the on-disk filename. Cube files are kept in an LRU of at most
+    ``MAX_LOCAL_CUBES`` on disk; this is not Streamlit-cached (``build_frames`` is, and
+    holds the only long-lived result). Returns ``local_path``/``bounds``/flip flags,
+    or ``{"error": ...}``.
+    """
+    safe_name = f"{sensor}_{glacier_id}".replace(" ", "_").replace("/", "")
+    local_path = os.path.join(tempfile.gettempdir(), f"{safe_name}{CUBE_SUFFIX}")
+
+    try:
+        with _lock_for(local_path):
+            if not os.path.exists(local_path):
+                _download_blob(cube_uri, local_path)
+            else:
+                os.utime(local_path, None)  # mark as most-recently-used
+            _prune_cube_cache()
+
+        with xr.open_dataset(local_path, engine="h5netcdf") as ds:
             x_name = "x" if "x" in ds.coords else "easting"
             y_name = "y" if "y" in ds.coords else "northing"
             x, y = ds.coords[x_name].values, ds.coords[y_name].values
-            
-            src_crs_wkt = next((ds[var].attrs.get('wkt') or ds[var].attrs.get('spatial_ref') 
-                                for var in ds.data_vars if 'wkt' in ds[var].attrs or 'spatial_ref' in ds[var].attrs), "EPSG:32607")
-            
-            transformer = Transformer.from_crs(src_crs_wkt, "EPSG:4326", always_xy=True)
+
+            src_crs = next(
+                (
+                    ds[var].attrs.get("wkt") or ds[var].attrs.get("spatial_ref")
+                    for var in ds.data_vars
+                    if "wkt" in ds[var].attrs or "spatial_ref" in ds[var].attrs
+                ),
+                "EPSG:32607",
+            )
+
+            transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
             lon_nw, lat_nw = transformer.transform(x[0], y[-1])
             lon_se, lat_se = transformer.transform(x[-1], y[0])
-            
             bounds = [[float(lat_se), float(lon_nw)], [float(lat_nw), float(lon_se)]]
-            
+
         return {
-            "local_path": local_path, 
-            "bounds": bounds, 
-            "flip_y": bool(y[0] < y[-1]), 
-            "flip_x": bool(x[0] > x[-1])
+            "local_path": local_path,
+            "bounds": bounds,
+            "flip_y": bool(y[0] < y[-1]),
+            "flip_x": bool(x[0] > x[-1]),
         }
-        
-    except Exception as e:
-        return {"error": str(e)}
 
-def get_local_slice(cube_meta: dict, date_str: str, var_name: str = "albedo"):
-    """Instantly slices the local NetCDF file."""
-    with xr.open_dataset(cube_meta["local_path"]) as ds:
-        if "time" in ds.coords: time_slice = ds[var_name].sel(time=date_str, method="nearest")
-        elif "year" in ds.coords: time_slice = ds[var_name].sel(year=int(date_str[:4]))
-        else: time_slice = ds[var_name].isel(time=0)
-        
-        albedo_data = time_slice.values
-        
-    if cube_meta["flip_y"]: albedo_data = np.flipud(albedo_data)
-    if cube_meta["flip_x"]: albedo_data = np.fliplr(albedo_data)
-    
-    return albedo_data
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user in the UI
+        return {"error": str(exc)}
 
-def array_to_png_data_url(data: np.ndarray, vmin=0.1, vmax=0.9, cmap_name="Greys_r"):
+
+def _time_labels(ds: xr.Dataset) -> list[str]:
+    """Human-readable label for every time step in the cube."""
+    if "time" in ds.coords:
+        days = ds["time"].values.astype("datetime64[D]")
+        return [str(d) for d in days]
+    if "year" in ds.coords:
+        return [str(int(v)) for v in ds["year"].values]
+    return ["0"]
+
+
+@st.cache_data(
+    show_spinner="Loading albedo cube...",
+    max_entries=FRAMES_CACHE_ENTRIES,
+    ttl=FRAMES_CACHE_TTL,
+)
+def build_frames(cube_uri: str, glacier_id: str, sensor: str) -> dict:
+    """Colorize every time step of a glacier's cube into a PNG data URL.
+
+    Returns ``{"bounds": [...], "frames": [{"label": str, "url": str}, ...]}`` so the
+    browser can scrub through time without any Streamlit reruns, or ``{"error": ...}``.
+    """
+    cube_meta = prepare_local_cube(cube_uri, glacier_id, sensor)
+    if "error" in cube_meta:
+        return cube_meta
+
+    try:
+        with xr.open_dataset(cube_meta["local_path"], engine="h5netcdf") as ds:
+            labels = _time_labels(ds)
+            cube = np.asarray(ds[ALBEDO_VAR].values, dtype="float32")
+
+        offset = SENSORS[sensor]["albedo_offset"]
+        if offset:
+            cube = cube + offset
+        if cube.ndim == 2:  # single time step
+            cube = cube[None, ...]
+        if cube_meta["flip_y"]:
+            cube = cube[:, ::-1, :]
+        if cube_meta["flip_x"]:
+            cube = cube[:, :, ::-1]
+
+        frames = [
+            {"label": label, "url": array_to_png_data_url(cube[i])}
+            for i, label in enumerate(labels[: cube.shape[0]])
+        ]
+        frames = [f for f in frames if f["url"]]
+        return {"bounds": cube_meta["bounds"], "frames": frames}
+
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers
+# ---------------------------------------------------------------------------
+def _colormap_css_stops(cmap_name: str = ALBEDO_CMAP, n: int = 24) -> list[str]:
+    """Sample a matplotlib colormap into hex stops spanning vmin -> vmax."""
+    try:
+        cmap = mpl.colormaps[cmap_name]
+    except KeyError:
+        cmap = mpl.colormaps["viridis"]
+    return [mcolors.to_hex(cmap(i / (n - 1))) for i in range(n)]
+
+
+def array_to_png_data_url(
+    data: np.ndarray,
+    vmin: float = ALBEDO_VMIN,
+    vmax: float = ALBEDO_VMAX,
+    cmap_name: str = ALBEDO_CMAP,
+) -> str | None:
+    """Colorize a 2D array and return it as a base64 PNG data URL for a map overlay."""
     data = np.squeeze(data)
-    if data.ndim == 1: data = data.reshape(data.shape[0], 1)
-    elif data.ndim != 2: return None
+    if data.ndim == 1:
+        data = data.reshape(data.shape[0], 1)
+    elif data.ndim != 2:
+        return None
 
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
-    try: cmap = cm.get_cmap(cmap_name)
-    except ValueError: cmap = cm.get_cmap("viridis")
-    
+    try:
+        cmap = mpl.colormaps[cmap_name]
+    except KeyError:
+        cmap = mpl.colormaps["viridis"]
+
     rgba = cmap(norm(data))
     mask = np.isnan(data) | (data < vmin) | (data > vmax)
-    rgba[mask, 3] = 0.0  
-    
-    rgba_uint8 = (rgba * 255).astype(np.uint8)
-    img = Image.fromarray(rgba_uint8, mode="RGBA")
+    rgba[mask, 3] = 0.0
+
+    img = Image.fromarray((rgba * 255).astype(np.uint8), mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
 
 
-st.set_page_config(
-    page_title="Alaska Glacier Albedo Explorer",
-    layout="wide"
-)
-
 @st.cache_data
-def load_glacier_data():
-    gdf = gpd.read_parquet("glacier_index_v2.parquet")
+def load_glacier_data() -> gpd.GeoDataFrame:
+    """Load the glacier index, normalize geometries, and reproject to EPSG:4326."""
+
     def clean_geometry(geom):
-        if geom is None:
-            return None
-        if geom.geom_type in ['Polygon', 'MultiPolygon']:
+        if geom is None or geom.geom_type in ("Polygon", "MultiPolygon"):
             return geom
-        if geom.geom_type == 'GeometryCollection':
+        if geom.geom_type == "GeometryCollection":
             polys = []
             for g in geom.geoms:
-                if g.geom_type == 'Polygon':
+                if g.geom_type == "Polygon":
                     polys.append(g)
-                elif g.geom_type == 'MultiPolygon':
-                    polys.extend(list(g.geoms))
+                elif g.geom_type == "MultiPolygon":
+                    polys.extend(g.geoms)
             if polys:
                 return MultiPolygon(polys)
-        return geom           
-    gdf['geometry'] = gdf['geometry'].apply(clean_geometry)
-    keep_cols = ['glacier_name', 'gcs_uri', 'geometry', 'rgi_id']
+        return geom
+
+    gdf = gpd.read_parquet(GLACIER_INDEX_PATH)
+    gdf["geometry"] = gdf["geometry"].apply(clean_geometry)
+    uri_cols = [cfg["uri_col"] for cfg in SENSORS.values()]
+    keep_cols = ["glacier_name", "geometry", "rgi_id", *uri_cols]
     gdf = gdf[[c for c in keep_cols if c in gdf.columns]]
     if gdf.crs != "EPSG:4326":
         gdf = gdf.to_crs("EPSG:4326")
     return gdf
 
+
+def render_map(
+    frame_data: dict | None, outline_geojson: dict | None, sensor: str | None = None
+) -> None:
+    """Render a self-contained Leaflet map with a client-side time slider.
+
+    The map only reloads when its HTML changes (i.e. a different glacier). Moving the
+    slider swaps the single image overlay in the browser with no Streamlit rerun.
+    """
+    frames = (frame_data or {}).get("frames", [])
+    bounds = (frame_data or {}).get("bounds")
+
+    gradient = "linear-gradient(to top, " + ", ".join(_colormap_css_stops()) + ")"
+    payload = json.dumps(
+        {
+            "frames": frames,
+            "bounds": bounds,
+            "outline": outline_geojson,
+            "opacity": OVERLAY_OPACITY,
+            "alaska": ALASKA_VIEW,
+            "mapHeight": MAP_HEIGHT,
+            "legend": {
+                "title": f"Albedo — {sensor}" if sensor else "Albedo",
+                "gradient": gradient,
+                "ticks": [
+                    f"{v:.2f}" for v in np.linspace(ALBEDO_VMAX, ALBEDO_VMIN, 5)
+                ],
+            },
+        }
+    )
+
+    html = _MAP_TEMPLATE.replace("__PAYLOAD__", payload)
+    components.html(html, height=MAP_HEIGHT + CONTROLS_HEIGHT)
+
+
+_MAP_TEMPLATE = """
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body { margin: 0; font-family: -apple-system, system-ui, sans-serif; }
+  #map { width: 100%; height: __MAP_H__px; }
+  #controls {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 6px; height: __CTRL_H__px; box-sizing: border-box;
+  }
+  #controls button {
+    width: 34px; height: 34px; border: 1px solid #ccc; border-radius: 6px;
+    background: #fff; cursor: pointer; font-size: 14px;
+  }
+  #controls button:disabled { opacity: 0.4; cursor: default; }
+  #slider { flex: 1; }
+  #slider:disabled { opacity: 0.4; }
+  #label {
+    font-variant-numeric: tabular-nums; min-width: 96px; text-align: right;
+    color: #333;
+  }
+  /* Show albedo cells as sharp blocks instead of bilinear-smoothed mush. */
+  .albedo-overlay {
+    image-rendering: -webkit-optimize-contrast;
+    image-rendering: crisp-edges;
+    image-rendering: pixelated;
+  }
+  .albedo-legend {
+    background: rgba(255, 255, 255, 0.9);
+    padding: 6px 8px; border-radius: 4px;
+    font: 11px/1.2 -apple-system, system-ui, sans-serif; color: #333;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  }
+  .albedo-legend .title { font-weight: 600; text-align: center; margin-bottom: 4px; }
+  .albedo-legend .body { display: flex; gap: 4px; }
+  .albedo-legend .bar {
+    width: 14px; height: 110px; border: 1px solid #999;
+  }
+  .albedo-legend .ticks {
+    display: flex; flex-direction: column; justify-content: space-between;
+    height: 112px; font-variant-numeric: tabular-nums;
+  }
+</style>
+<div id="map"></div>
+<div id="controls">
+  <button id="play" title="Play / pause">&#9654;</button>
+  <input id="slider" type="range" min="0" max="0" value="0" step="1"/>
+  <span id="label"></span>
+</div>
+<script>
+(function () {
+  var D = __PAYLOAD__;
+  var map = L.map('map');
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxNativeZoom: 19, maxZoom: 22,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+  L.control.scale({ position: 'bottomleft', metric: true, imperial: true }).addTo(map);
+
+  if (D.bounds) { map.fitBounds(D.bounds); }
+  else { map.setView(D.alaska.center, D.alaska.zoom); }
+  setTimeout(function () { map.invalidateSize(); }, 120);
+
+  var frames = D.frames || [];
+
+  if (D.legend && frames.length) {
+    var legend = L.control({ position: 'bottomright' });
+    legend.onAdd = function () {
+      var div = L.DomUtil.create('div', 'albedo-legend');
+      var ticks = D.legend.ticks.map(function (t) {
+        return '<span>' + t + '</span>';
+      }).join('');
+      div.innerHTML =
+        '<div class="title">' + D.legend.title + '</div>' +
+        '<div class="body">' +
+          '<div class="bar" style="background:' + D.legend.gradient + '"></div>' +
+          '<div class="ticks">' + ticks + '</div>' +
+        '</div>';
+      return div;
+    };
+    legend.addTo(map);
+  }
+
+  if (D.outline) {
+    L.geoJSON(D.outline, {
+      style: { color: '#1f77b4', weight: 2, fillOpacity: 0.0 },
+      onEachFeature: function (feat, layer) {
+        var p = feat.properties || {};
+        layer.bindTooltip(
+          '<b>' + (p.glacier_name || '') + '</b><br>RGI ID: ' + (p.rgi_id || ''),
+          { sticky: true }
+        );
+      }
+    }).addTo(map);
+  }
+
+  var slider = document.getElementById('slider');
+  var label = document.getElementById('label');
+  var playBtn = document.getElementById('play');
+  var overlay = null;
+  var cur = 0;
+  var timer = null;
+
+  function render(i) {
+    cur = i;
+    var fr = frames[i];
+    if (!overlay) {
+      overlay = L.imageOverlay(fr.url, D.bounds, {
+        opacity: D.opacity, interactive: false, className: 'albedo-overlay'
+      }).addTo(map);
+    } else {
+      overlay.setUrl(fr.url);
+    }
+    label.textContent = fr.label;
+    if (+slider.value !== i) slider.value = i;
+  }
+
+  if (!frames.length) {
+    slider.disabled = true;
+    playBtn.disabled = true;
+    label.textContent = 'Select a glacier';
+    return;
+  }
+
+  frames.forEach(function (f) { var im = new Image(); im.src = f.url; });  // preload
+  slider.max = frames.length - 1;
+  render(frames.length - 1);
+
+  slider.addEventListener('input', function (e) { render(+e.target.value); });
+  playBtn.addEventListener('click', function () {
+    if (timer) {
+      clearInterval(timer); timer = null; playBtn.innerHTML = '&#9654;';
+      return;
+    }
+    playBtn.innerHTML = '&#10073;&#10073;';
+    timer = setInterval(function () {
+      render((cur + 1) % frames.length);
+    }, 350);
+  });
+})();
+</script>
+""".replace("__MAP_H__", str(MAP_HEIGHT)).replace("__CTRL_H__", str(CONTROLS_HEIGHT))
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Alaska Glacier Albedo Explorer", layout="wide")
+
 gdf = load_glacier_data()
+gdf = gdf.dropna(subset=["rgi_id"]).drop_duplicates(subset=["rgi_id"])
+_name_by_rgi = dict(zip(gdf["rgi_id"], gdf["glacier_name"].fillna("")))
 
-glacier_names = sorted(gdf['glacier_name'].dropna().unique().tolist())
 
-if "map_center" not in st.session_state:
-    st.session_state.map_center = [64.2, -149.5]
-if "map_zoom" not in st.session_state:
-    st.session_state.map_zoom = 5
-if "move_camera" not in st.session_state:
-    st.session_state.move_camera = False  # NEW FLAG
-    
-def fly_to_glacier():
-    selected = st.session_state.glacier_search
-    if selected:
-        glacier_row = gdf[gdf['glacier_name'] == selected].iloc[0]
-        centroid = glacier_row.geometry.centroid
-        st.session_state.map_center = [centroid.y, centroid.x]
-        st.session_state.map_zoom = 11
-        st.session_state.move_camera = True # Trigger the map to move
-    else:
-        st.session_state.map_center = [64.2, -149.5]
-        st.session_state.map_zoom = 5
-        st.session_state.move_camera = True
+def glacier_name_of(rgi_id: str) -> str:
+    """Display name for a glacier, falling back to its RGI ID when unnamed."""
+    return (_name_by_rgi.get(rgi_id) or "").strip() or rgi_id
+
+
+def glacier_label(rgi_id: str) -> str:
+    """Dropdown label: ``Name — RGI ID`` (or just the RGI ID when unnamed)."""
+    name = (_name_by_rgi.get(rgi_id) or "").strip()
+    return f"{name} — {rgi_id}" if name else rgi_id
+
+
+rgi_options = sorted(
+    gdf["rgi_id"],
+    key=lambda r: (not (_name_by_rgi.get(r) or "").strip(), glacier_label(r).lower()),
+)  # named glaciers first (A-Z), then unnamed by RGI ID
 
 st.title("Alaska Glacier Albedo Explorer")
 st.markdown(
-    "Explore daily albedo data for glaciers across Alaska. Use the sidebar to search "
-    "for a specific glacier and across time."
+    "Explore albedo data for glaciers across Alaska. Choose a sensor and glacier in "
+    "the sidebar, then scrub or play the time slider under the map."
 )
 
 with st.sidebar:
     st.header("Controls")
-    
-    selected_glacier = st.selectbox(
-        "Search for a Glacier:",
-        options=glacier_names,
+    sensor = st.selectbox(
+        "Sensor:",
+        options=list(SENSORS),
+        index=list(SENSORS).index(DEFAULT_SENSOR),
+        key="sensor",
+    )
+    selected_rgi = st.selectbox(
+        "Search by glacier name or RGI ID:",
+        options=rgi_options,
+        index=None,
+        format_func=glacier_label,
+        placeholder="Type a glacier name or RGI ID...",
         key="glacier_search",
-        help="Type or select a glacier to zoom in.",
-        on_change=fly_to_glacier
     )
-    
-    selected_date = st.slider(
-        "Select Date (Daily Resolution):",
-        min_value=datetime.date(2019, 1, 1),
-        max_value=datetime.date(2025, 12, 31),
-        value=datetime.date(2023, 7, 15),
-        format="YYYY-MM-DD"
-    )
-    
+
+uri_col = SENSORS[sensor]["uri_col"]
+
+frame_data = None
+outline_geojson = None
+cube_uri = None
+if selected_rgi:
+    match = gdf.loc[gdf["rgi_id"] == selected_rgi]
+    row = match.iloc[0]
+    cube_uri = row[uri_col]
+    frame_data = build_frames(cube_uri, selected_rgi, sensor)
+    outline_geojson = json.loads(match[["glacier_name", "rgi_id", "geometry"]].to_json())
+
+with st.sidebar:
     st.divider()
-    
     st.subheader("Export")
-    st.markdown("*Select a glacier to enable downloads.*")
-    if selected_glacier:
-        gcs_uri = gdf[gdf['glacier_name'] == selected_glacier].iloc[0]['gcs_uri']
-        with st.spinner(f"Downloading full cube for {selected_glacier}..."):
-            cube_meta = prepare_local_cube(gcs_uri, selected_glacier)
-        if "error" not in cube_meta:
-            with open(cube_meta["local_path"], "rb") as f:
-                st.download_button(
-                    label=f"Download {selected_glacier} NetCDF",
-                    data=f,
-                    file_name=f"{selected_glacier.replace(' ', '_')}_albedo.nc",
-                    mime="application/x-netcdf"
-                )
-        else:
-            st.error(f"Error fetching data: {cube_meta['error']}")
-    else:
+    if not selected_rgi:
         st.markdown("*Select a glacier to enable downloads.*")
-        
-# m = folium.Map(location=[64.2, -149.5], zoom_start=5, tiles="CartoDB Voyager")
-m = folium.Map(
-    location=st.session_state.map_center, 
-    zoom_start=st.session_state.map_zoom, 
-    tiles="CartoDB Voyager"
-)
-# Assuming `selected_glacier` and `selected_date` are defined from the sidebar
-active_raster = None
-if st.session_state.glacier_search:
-    selected_uri = gdf[gdf["glacier_name"] == st.session_state.glacier_search].iloc[0]["gcs_uri"]
-    with st.spinner(f"Preparing full data cube for {st.session_state.glacier_search}..."):
-        cube_meta = prepare_local_cube(selected_uri, st.session_state.glacier_search)
-        
-    if "error" not in cube_meta:
-        # 2. Format the slider's date object into a string pandas/xarray understands
-        formatted_date = selected_date.strftime("%Y-%m-%d")
-        
-        # 3. Instantly pull the 2D slice from the local file
-        albedo_data = get_local_slice(cube_meta, formatted_date)
-        
-        # 4. Colorize and convert to PNG
-        png_url = array_to_png_data_url(albedo_data)
-        if png_url:
-            active_raster = {"url": png_url, "bounds": cube_meta["bounds"]}
     else:
-        st.error(f"Failed to load data: {cube_meta['error']}")    # with st.spinner(f"Fetching albedo cube for {st.session_state.glacier_search}..."):
-    #     cube_result = fetch_kerchunk_slice(selected_uri, selected_date.strftime("%Y-%m-%d"))
-    #     print(cube_result)
-    #     if "error" not in cube_result:
-    #         png_url = array_to_png_data_url(cube_result["data"])
-    #         if png_url:
-    #             active_raster = {"url": png_url, "bounds": cube_result["bounds"]}
-    #     else:
-    #         st.error(f"Failed to load data: {cube_result['error']}")
-    
-if active_raster:
-    ImageOverlay(
-        image=active_raster["url"],
-        bounds=active_raster["bounds"],
-        opacity=0.85,
-        interactive=False,
-        cross_origin=False,
-        z_index=1
-    ).add_to(m)
+        name = glacier_name_of(selected_rgi)
+        try:
+            st.link_button(
+                f"Download {name} — {sensor} NetCDF",
+                signed_download_url(cube_uri),
+                help="Temporary link straight from Google Cloud Storage (expires in 15 min).",
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not create download link: {exc}")
 
-if st.session_state.glacier_search:
-    glacier_gdf = gdf[gdf['glacier_name'] == st.session_state.glacier_search]
-    tooltip = folium.GeoJsonTooltip(
-        fields=['glacier_name', 'rgi_id'],
-        aliases=['Glacier Name:', 'RGI ID:'],
-        style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;")
-    )
-    folium.GeoJson(
-        glacier_gdf.to_json(),
-        name="Glacier Outline",
-        style_function=lambda x: {'color': '#1f77b4', 'weight': 2, 'fillOpacity': 0.1},
-        tooltip=tooltip
-    ).add_to(m)
+if frame_data and "error" in frame_data:
+    st.error(f"Failed to load data: {frame_data['error']}")
 
-center_arg = st.session_state.map_center if st.session_state.move_camera else None
-zoom_arg = st.session_state.map_zoom if st.session_state.move_camera else None
-
-st_data = st_folium(
-    m, 
-    use_container_width=True, 
-    height=600,
-    center=center_arg, 
-    zoom=zoom_arg,     
-    returned_objects=["center", "zoom"] # MUST be captured to preserve manual panning
+render_map(
+    frame_data if frame_data and "error" not in frame_data else None,
+    outline_geojson,
+    sensor,
 )
-
-if st_data and st_data.get("center"):
-    st.session_state.map_center = [st_data["center"]["lat"], st_data["center"]["lng"]]
-    st.session_state.map_zoom = st_data["zoom"]
-if st.session_state.move_camera:
-    st.session_state.move_camera = False
