@@ -22,11 +22,10 @@ from shapely.geometry import MultiPolygon
 GLACIER_INDEX_URI = "gs://alaska-albedo-scenes-cmu-research-bucket/indexes/glacier_index_complete.parquet"
 SIGNED_URL_TTL = datetime.timedelta(minutes=15)
 
-# Sensors selectable in the sidebar. ``uri_col`` is the raw NetCDF cube URI column in
-# the index; ``albedo_offset`` is a per-sensor additive bias correction.
 SENSORS = {
-    "Sentinel 2": {"uri_col": "s2_gcs_uri", "albedo_offset": 0.0681},
-    "Landsat 8": {"uri_col": "l8_gcs_uri", "albedo_offset": 0.0681},
+    "Sentinel 2": {"uri_col": "s2_gcs_uri"},
+    "Landsat 8": {"uri_col": "l8_gcs_uri"},
+    "Landsat 9": {"uri_col": "l8_gcs_uri"},
 }
 DEFAULT_SENSOR = "Sentinel 2"
 
@@ -187,9 +186,6 @@ def build_frames(cube_uri: str, glacier_id: str, sensor: str) -> dict:
             labels = _time_labels(ds)
             cube = np.asarray(ds[ALBEDO_VAR].values, dtype="float32")
 
-        offset = SENSORS[sensor]["albedo_offset"]
-        if offset:
-            cube = cube + offset
         if cube.ndim == 2:  # single time step
             cube = cube[None, ...]
         if cube_meta["flip_y"]:
