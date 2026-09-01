@@ -25,7 +25,7 @@ SIGNED_URL_TTL = datetime.timedelta(minutes=15)
 SENSORS = {
     "Sentinel 2": {"uri_col": "s2_gcs_uri"},
     "Landsat 8": {"uri_col": "l8_gcs_uri"},
-    "Landsat 9": {"uri_col": "l8_gcs_uri"},
+    "Landsat 9": {"uri_col": "l9_gcs_uri"},
 }
 DEFAULT_SENSOR = "Sentinel 2"
 
